@@ -11,6 +11,14 @@ use crate::entity::TypeId;
 use crate::ir::context::Context;
 use crate::ir::types::TypeKind;
 
+/// Check if a CIR type is an aggregate that gets passed as a pointer to stack data.
+/// These types need sret (struct return) convention when returned from functions.
+pub fn is_aggregate_type(ctx: &Context, ty: TypeId) -> bool {
+    matches!(ctx.type_kind(ty), TypeKind::Extension(ext)
+        if ext.dialect == "cir" && matches!(ext.name.as_str(),
+            "optional" | "error_union" | "struct" | "array" | "slice" | "tagged_union"))
+}
+
 /// Map a CIR type to a Cranelift scalar type.
 ///
 /// Returns `None` for aggregate types that must be lowered via stack slots
@@ -29,7 +37,57 @@ pub fn to_cranelift_type(ctx: &Context, ty: TypeId) -> Option<types::Type> {
         // Pointers and references are lowered as 64-bit integers.
         TypeKind::Extension(ext) if ext.dialect == "cir" && ext.name == "ptr" => Some(types::I64),
         TypeKind::Extension(ext) if ext.dialect == "cir" && ext.name == "ref" => Some(types::I64),
-        _ => None, // struct, array, slice, etc. -> stack slot
+        // Aggregates passed as pointers to stack slots.
+        TypeKind::Extension(ext) if ext.dialect == "cir" && ext.name == "optional" => {
+            Some(types::I64)
+        }
+        TypeKind::Extension(ext) if ext.dialect == "cir" && ext.name == "error_union" => {
+            Some(types::I64)
+        }
+        TypeKind::Extension(ext) if ext.dialect == "cir" && ext.name == "slice" => {
+            Some(types::I64)
+        }
+        // Enums are integer tags.
+        TypeKind::Extension(ext) if ext.dialect == "cir" && ext.name == "enum" => {
+            Some(types::I32)
+        }
+        _ => None, // struct, array, etc. -> stack slot
+    }
+}
+
+/// Compute the byte size of a CIR type for Cranelift stack allocation.
+///
+/// Returns the size in bytes for scalar types and pointers. Aggregate types
+/// (struct, array, slice) will need layout computation from their construct
+/// crate — this function returns a pointer-sized default for unknown types.
+pub fn type_byte_size(ctx: &Context, ty: TypeId) -> u32 {
+    // Extract extension type info to avoid holding borrow during recursion.
+    enum Info {
+        Scalar(u32),
+        CirExt { name: String, payload: Option<TypeId> },
+    }
+
+    let info = match ctx.type_kind(ty) {
+        TypeKind::Integer { width } => Info::Scalar(((*width + 7) / 8) as u32),
+        TypeKind::Float { width } => Info::Scalar((*width / 8) as u32),
+        TypeKind::Index => Info::Scalar(8),
+        TypeKind::Extension(ext) if ext.dialect == "cir" => Info::CirExt {
+            name: ext.name.clone(),
+            payload: ext.type_params.first().copied(),
+        },
+        _ => Info::Scalar(8),
+    };
+
+    match info {
+        Info::Scalar(s) => s,
+        Info::CirExt { ref name, payload } => match name.as_str() {
+            "ptr" | "ref" => 8,
+            "optional" => payload.map(|p| type_byte_size(ctx, p)).unwrap_or(8) + 1,
+            "error_union" => payload.map(|p| type_byte_size(ctx, p)).unwrap_or(8) + 2,
+            "slice" => 16, // {ptr: i64, len: i64}
+            "enum" => 4,   // i32 tag
+            _ => 8,
+        },
     }
 }
 

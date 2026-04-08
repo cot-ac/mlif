@@ -10,10 +10,13 @@ use std::process::Command;
 /// C runtime, setting the correct entry point (`_main` on macOS, `main`
 /// on Linux), and producing a valid executable format.
 pub fn link_executable(obj_path: &str, exe_path: &str) -> Result<(), String> {
-    let status = Command::new("cc")
-        .arg(obj_path)
-        .arg("-o")
-        .arg(exe_path)
+    let mut cmd = Command::new("cc");
+    cmd.arg(obj_path).arg("-o").arg(exe_path);
+    // On macOS, allow text relocations for Cranelift-generated data references.
+    if cfg!(target_os = "macos") {
+        cmd.arg("-Wl,-no_fixup_chains");
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("failed to run cc: {}", e))?;
 

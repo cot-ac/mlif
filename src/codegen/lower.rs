@@ -21,15 +21,25 @@ use crate::ir::attributes::Attribute;
 use crate::ir::context::Context;
 use crate::ir::types::TypeKind;
 
-use super::types::to_cranelift_type;
+use super::types::{is_aggregate_type, to_cranelift_type, type_byte_size};
+
+use super::construct_lowering::LoweringRegistry;
+use super::lowering_ctx::LoweringCtx;
 
 /// Lower an entire CIR module to a native object file.
 ///
 /// The `module_op` must be a `builtin.module` operation (or any top-level
 /// container whose single region holds `func.func` operations).
 ///
+/// `registry` provides construct-specific lowering implementations.
+/// If `None`, only framework ops (func.call, func.return) are lowered.
+///
 /// Returns the raw bytes of a relocatable object file suitable for linking.
-pub fn lower_module(ctx: &Context, module_op: OpId) -> Result<Vec<u8>, String> {
+pub fn lower_module(
+    ctx: &Context,
+    module_op: OpId,
+    registry: Option<&LoweringRegistry>,
+) -> Result<Vec<u8>, String> {
     // --- Set up Cranelift target ---
     let shared_builder = settings::builder();
     let shared_flags = settings::Flags::new(shared_builder);
@@ -59,7 +69,9 @@ pub fn lower_module(ctx: &Context, module_op: OpId) -> Result<Vec<u8>, String> {
         .ok_or("module region has no entry block")?;
 
     // First pass: declare all functions so cross-calls can resolve.
-    let mut func_declarations: HashMap<String, (cranelift_module::FuncId, Signature, OpId)> =
+    // Tuple: (FuncId, Signature, OpId, sret_size)
+    // sret_size is Some(bytes) if the function returns an aggregate via pointer.
+    let mut func_declarations: HashMap<String, (cranelift_module::FuncId, Signature, OpId, Option<u32>)> =
         HashMap::new();
     let mut func_order: Vec<String> = Vec::new();
 
@@ -81,7 +93,7 @@ pub fn lower_module(ctx: &Context, module_op: OpId) -> Result<Vec<u8>, String> {
             )),
         };
 
-        let sig = build_signature(ctx, func_type_id, &object_module)?;
+        let (sig, sret_size) = build_signature(ctx, func_type_id, &object_module)?;
 
         // Export `main`, keep everything else local.
         let linkage = if func_name == "main" {
@@ -94,13 +106,13 @@ pub fn lower_module(ctx: &Context, module_op: OpId) -> Result<Vec<u8>, String> {
             .declare_function(&func_name, linkage, &sig)
             .map_err(|e| format!("declare_function '{}': {}", func_name, e))?;
 
-        func_declarations.insert(func_name.clone(), (func_id, sig, op));
+        func_declarations.insert(func_name.clone(), (func_id, sig, op, sret_size));
         func_order.push(func_name);
     }
 
     // Second pass: lower each function body.
     for func_name in &func_order {
-        let (func_id, ref sig, func_op) = func_declarations[func_name];
+        let (func_id, ref sig, func_op, sret_size) = func_declarations[func_name];
 
         let mut cl_ctx = cranelift_codegen::Context::new();
         cl_ctx.func = Function::with_name_signature(
@@ -117,6 +129,8 @@ pub fn lower_module(ctx: &Context, module_op: OpId) -> Result<Vec<u8>, String> {
             &mut builder,
             &mut object_module,
             &func_declarations,
+            registry,
+            sret_size,
         )?;
 
         builder.finalize();
@@ -134,35 +148,49 @@ pub fn lower_module(ctx: &Context, module_op: OpId) -> Result<Vec<u8>, String> {
 }
 
 /// Build a Cranelift Signature from a CIR function type.
+///
+/// Returns `(signature, sret_size)` where `sret_size` is `Some(bytes)` if the
+/// function returns an aggregate that needs the sret calling convention
+/// (caller allocates, callee writes via pointer parameter).
 fn build_signature(
     ctx: &Context,
     func_type: TypeId,
     object_module: &ObjectModule,
-) -> Result<Signature, String> {
+) -> Result<(Signature, Option<u32>), String> {
     let (param_types, result_types) = match ctx.type_kind(func_type) {
         TypeKind::Function { params, results } => (params.clone(), results.clone()),
         _ => return Err("expected function type".into()),
     };
 
     let mut sig = object_module.make_signature();
+    let mut sret_size: Option<u32> = None;
 
+    // Check if return type is aggregate — needs sret convention.
+    for &result_ty in &result_types {
+        if ctx.is_none_type(result_ty) {
+            continue;
+        }
+        if is_aggregate_type(ctx, result_ty) {
+            // Aggregate return: add implicit sret pointer as first param.
+            // Don't add to sig.returns — callee writes to sret pointer instead.
+            let size = type_byte_size(ctx, result_ty);
+            sret_size = Some(size);
+            sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I64));
+        } else {
+            let cl_ty = to_cranelift_type(ctx, result_ty)
+                .ok_or_else(|| format!("unsupported result type: {:?}", ctx.type_kind(result_ty)))?;
+            sig.returns.push(AbiParam::new(cl_ty));
+        }
+    }
+
+    // Regular parameters (after sret if present).
     for &param_ty in &param_types {
         let cl_ty = to_cranelift_type(ctx, param_ty)
             .ok_or_else(|| format!("unsupported parameter type: {:?}", ctx.type_kind(param_ty)))?;
         sig.params.push(AbiParam::new(cl_ty));
     }
 
-    for &result_ty in &result_types {
-        if ctx.is_none_type(result_ty) {
-            // void return — no return value in signature
-            continue;
-        }
-        let cl_ty = to_cranelift_type(ctx, result_ty)
-            .ok_or_else(|| format!("unsupported result type: {:?}", ctx.type_kind(result_ty)))?;
-        sig.returns.push(AbiParam::new(cl_ty));
-    }
-
-    Ok(sig)
+    Ok((sig, sret_size))
 }
 
 /// Lower a single func.func operation into the Cranelift FunctionBuilder.
@@ -171,7 +199,9 @@ fn lower_function(
     func_op: OpId,
     builder: &mut FunctionBuilder,
     object_module: &mut ObjectModule,
-    func_declarations: &HashMap<String, (cranelift_module::FuncId, Signature, OpId)>,
+    func_declarations: &HashMap<String, (cranelift_module::FuncId, Signature, OpId, Option<u32>)>,
+    registry: Option<&LoweringRegistry>,
+    sret_size: Option<u32>,
 ) -> Result<(), String> {
     // CIR ValueId -> Cranelift Value mapping.
     let mut value_map: HashMap<ValueId, cranelift_codegen::ir::Value> = HashMap::new();
@@ -195,11 +225,23 @@ fn lower_function(
     builder.switch_to_block(entry_cl_block);
 
     // Map CIR block arguments to Cranelift block params for the entry block.
+    // When sret is active, the first Cranelift param is the sret pointer (not a CIR arg).
     let cir_args = ctx[entry_cir_block].arguments().to_vec();
     let cl_params = builder.block_params(entry_cl_block).to_vec();
-    for (cir_arg, cl_param) in cir_args.iter().zip(cl_params.iter()) {
-        value_map.insert(*cir_arg, *cl_param);
-    }
+
+    let sret_ptr = if sret_size.is_some() {
+        // First param is the sret pointer — skip it when mapping CIR args.
+        let sret = cl_params[0];
+        for (cir_arg, cl_param) in cir_args.iter().zip(cl_params[1..].iter()) {
+            value_map.insert(*cir_arg, *cl_param);
+        }
+        Some(sret)
+    } else {
+        for (cir_arg, cl_param) in cir_args.iter().zip(cl_params.iter()) {
+            value_map.insert(*cir_arg, *cl_param);
+        }
+        None
+    };
 
     // Seal the entry block if it's the only block (no predecessors).
     // For multi-block functions, we seal after processing all blocks.
@@ -235,6 +277,9 @@ fn lower_function(
                 &mut value_map,
                 &block_map,
                 func_declarations,
+                registry,
+                sret_ptr,
+                sret_size,
             )?;
         }
     }
@@ -246,25 +291,64 @@ fn lower_function(
 }
 
 /// Lower a single CIR operation to Cranelift instructions.
+///
+/// Dispatch order:
+/// 1. Framework ops (func.call, func.return) — always handled here
+/// 2. Registered construct lowerings — each gets a chance to handle the op
+/// 3. Built-in fallback (cir.constant, cir.add, etc.) — for backwards compat
+///    until all ops move to construct crates
 fn lower_op(
     ctx: &Context,
     op: OpId,
     builder: &mut FunctionBuilder,
     object_module: &mut ObjectModule,
     value_map: &mut HashMap<ValueId, cranelift_codegen::ir::Value>,
-    _block_map: &HashMap<BlockId, cranelift_codegen::ir::Block>,
-    func_declarations: &HashMap<String, (cranelift_module::FuncId, Signature, OpId)>,
+    block_map: &HashMap<BlockId, cranelift_codegen::ir::Block>,
+    func_declarations: &HashMap<String, (cranelift_module::FuncId, Signature, OpId, Option<u32>)>,
+    registry: Option<&LoweringRegistry>,
+    sret_ptr: Option<cranelift_codegen::ir::Value>,
+    sret_size: Option<u32>,
 ) -> Result<(), String> {
     let op_name = ctx[op].name();
 
+    // Create unified LoweringCtx for all dispatch paths.
+    let mut lctx = LoweringCtx::new(ctx, builder, value_map, block_map, object_module, func_declarations, sret_ptr, sret_size);
+
+    // 1. Framework-level ops (func dialect) — always handled here
     match op_name {
-        "cir.constant" => lower_constant(ctx, op, builder, value_map),
-        "cir.add" => lower_binary_int(ctx, op, builder, value_map, BinaryIntOp::Add),
-        "cir.sub" => lower_binary_int(ctx, op, builder, value_map, BinaryIntOp::Sub),
-        "cir.mul" => lower_binary_int(ctx, op, builder, value_map, BinaryIntOp::Mul),
-        "func.return" => lower_return(ctx, op, builder, value_map),
-        "func.call" => lower_call(ctx, op, builder, object_module, value_map, func_declarations),
-        _ => Err(format!("unsupported operation: {}", op_name)),
+        "func.return" => return lctx.lower_return(op),
+        "func.call" => return lctx.lower_call(op),
+        _ => {}
+    }
+
+    // 2. Dispatch to registered construct lowerings
+    if let Some(reg) = registry {
+        for construct in reg.constructs() {
+            if construct.lower_op(op, &mut lctx)? {
+                return Ok(());
+            }
+        }
+    }
+
+    // 3. Built-in fallback — only used when registry is None (e.g., mlif unit tests).
+    // When ArithLowering is registered, these ops are handled by the construct crate
+    // and this fallback is never reached. Remove once mlif tests use a registry.
+    lower_op_fallback(ctx, op, &mut lctx)
+}
+
+/// Built-in fallback lowering for basic ops (used by mlif unit tests
+/// that don't register construct lowerings).
+fn lower_op_fallback(
+    ctx: &Context,
+    op: OpId,
+    lctx: &mut LoweringCtx,
+) -> Result<(), String> {
+    match ctx[op].name() {
+        "cir.constant" => lower_constant(ctx, op, lctx),
+        "cir.add" => lower_binary_int(ctx, op, lctx, BinaryIntOp::Add),
+        "cir.sub" => lower_binary_int(ctx, op, lctx, BinaryIntOp::Sub),
+        "cir.mul" => lower_binary_int(ctx, op, lctx, BinaryIntOp::Mul),
+        _ => Err(format!("unsupported operation: {}", ctx[op].name())),
     }
 }
 
@@ -272,29 +356,25 @@ fn lower_op(
 fn lower_constant(
     ctx: &Context,
     op: OpId,
-    builder: &mut FunctionBuilder,
-    value_map: &mut HashMap<ValueId, cranelift_codegen::ir::Value>,
+    lctx: &mut LoweringCtx,
 ) -> Result<(), String> {
-    let result_value = ctx[op].result(0);
-    let result_type = ctx.value_type(result_value);
-
     match ctx[op].get_attribute("value") {
         Some(Attribute::Integer { value, .. }) => {
-            let cl_type = to_cranelift_type(ctx, result_type)
-                .ok_or("cir.constant: unsupported integer type")?;
-            let cl_val = builder.ins().iconst(cl_type, *value);
-            value_map.insert(result_value, cl_val);
+            let cl_type = lctx.result_cranelift_type(op)?;
+            let r = lctx.ins().iconst(cl_type, *value);
+            lctx.set_result(op, r);
             Ok(())
         }
         Some(Attribute::Float { value, .. }) => {
-            match ctx.type_kind(result_type) {
+            let rt = lctx.result_type(op);
+            match ctx.type_kind(rt) {
                 TypeKind::Float { width: 32 } => {
-                    let cl_val = builder.ins().f32const(*value as f32);
-                    value_map.insert(result_value, cl_val);
+                    let r = lctx.ins().f32const(*value as f32);
+                    lctx.set_result(op, r);
                 }
                 TypeKind::Float { width: 64 } => {
-                    let cl_val = builder.ins().f64const(*value);
-                    value_map.insert(result_value, cl_val);
+                    let r = lctx.ins().f64const(*value);
+                    lctx.set_result(op, r);
                 }
                 _ => return Err("cir.constant: unsupported float width".into()),
             }
@@ -304,7 +384,7 @@ fn lower_constant(
     }
 }
 
-/// Binary integer operations supported by the lowering.
+/// Binary integer operations supported by the fallback lowering.
 enum BinaryIntOp {
     Add,
     Sub,
@@ -313,102 +393,20 @@ enum BinaryIntOp {
 
 /// Lower a binary integer op (cir.add, cir.sub, cir.mul) to iadd/isub/imul.
 fn lower_binary_int(
-    ctx: &Context,
+    _ctx: &Context,
     op: OpId,
-    builder: &mut FunctionBuilder,
-    value_map: &mut HashMap<ValueId, cranelift_codegen::ir::Value>,
+    lctx: &mut LoweringCtx,
     bin_op: BinaryIntOp,
 ) -> Result<(), String> {
-    let operands = ctx[op].operands();
-    if operands.len() != 2 {
-        return Err(format!(
-            "{}: expected 2 operands, got {}",
-            ctx[op].name(),
-            operands.len()
-        ));
-    }
+    let (lhs, rhs) = lctx.binary_operands(op)?;
 
-    let lhs = *value_map
-        .get(&operands[0])
-        .ok_or_else(|| format!("{}: left operand not found in value map", ctx[op].name()))?;
-    let rhs = *value_map
-        .get(&operands[1])
-        .ok_or_else(|| format!("{}: right operand not found in value map", ctx[op].name()))?;
-
-    let result = match bin_op {
-        BinaryIntOp::Add => builder.ins().iadd(lhs, rhs),
-        BinaryIntOp::Sub => builder.ins().isub(lhs, rhs),
-        BinaryIntOp::Mul => builder.ins().imul(lhs, rhs),
+    let r = match bin_op {
+        BinaryIntOp::Add => lctx.ins().iadd(lhs, rhs),
+        BinaryIntOp::Sub => lctx.ins().isub(lhs, rhs),
+        BinaryIntOp::Mul => lctx.ins().imul(lhs, rhs),
     };
 
-    let result_value = ctx[op].result(0);
-    value_map.insert(result_value, result);
-
-    Ok(())
-}
-
-/// Lower `func.return` to Cranelift `return_`.
-fn lower_return(
-    ctx: &Context,
-    op: OpId,
-    builder: &mut FunctionBuilder,
-    value_map: &HashMap<ValueId, cranelift_codegen::ir::Value>,
-) -> Result<(), String> {
-    let operands = ctx[op].operands();
-    let cl_values: Vec<cranelift_codegen::ir::Value> = operands
-        .iter()
-        .map(|&v| {
-            value_map
-                .get(&v)
-                .copied()
-                .ok_or_else(|| "func.return: operand not found in value map".to_string())
-        })
-        .collect::<Result<_, _>>()?;
-
-    builder.ins().return_(&cl_values);
-    Ok(())
-}
-
-/// Lower `func.call` to Cranelift `call`.
-fn lower_call(
-    ctx: &Context,
-    op: OpId,
-    builder: &mut FunctionBuilder,
-    object_module: &mut ObjectModule,
-    value_map: &mut HashMap<ValueId, cranelift_codegen::ir::Value>,
-    func_declarations: &HashMap<String, (cranelift_module::FuncId, Signature, OpId)>,
-) -> Result<(), String> {
-    let callee_name = match ctx[op].get_attribute("callee") {
-        Some(Attribute::SymbolRef(name)) => name.clone(),
-        _ => return Err("func.call: missing callee attribute".into()),
-    };
-
-    let (callee_func_id, _, _) = func_declarations
-        .get(&callee_name)
-        .ok_or_else(|| format!("func.call: unknown callee '{}'", callee_name))?;
-
-    let callee_ref = object_module.declare_func_in_func(*callee_func_id, builder.func);
-
-    let operands = ctx[op].operands();
-    let cl_args: Vec<cranelift_codegen::ir::Value> = operands
-        .iter()
-        .map(|&v| {
-            value_map
-                .get(&v)
-                .copied()
-                .ok_or_else(|| "func.call: argument not found in value map".to_string())
-        })
-        .collect::<Result<_, _>>()?;
-
-    let call_inst = builder.ins().call(callee_ref, &cl_args);
-
-    // Map call results to CIR result values.
-    let cl_results = builder.inst_results(call_inst).to_vec();
-    let cir_results = ctx[op].results();
-    for (cir_result, cl_result) in cir_results.iter().zip(cl_results.iter()) {
-        value_map.insert(*cir_result, *cl_result);
-    }
-
+    lctx.set_result(op, r);
     Ok(())
 }
 
@@ -680,28 +678,28 @@ mod tests {
     #[test]
     fn test_lower_return_42() {
         let (ctx, module_op) = build_return_42_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering should succeed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering should succeed");
         assert!(!bytes.is_empty(), "object file should not be empty");
     }
 
     #[test]
     fn test_lower_add_call() {
         let (ctx, module_op) = build_add_call_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering should succeed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering should succeed");
         assert!(!bytes.is_empty(), "object file should not be empty");
     }
 
     #[test]
     fn test_lower_sub() {
         let (ctx, module_op) = build_sub_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering should succeed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering should succeed");
         assert!(!bytes.is_empty(), "object file should not be empty");
     }
 
     #[test]
     fn test_lower_mul() {
         let (ctx, module_op) = build_mul_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering should succeed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering should succeed");
         assert!(!bytes.is_empty(), "object file should not be empty");
     }
 
@@ -718,7 +716,7 @@ mod tests {
             vec![module_region],
             Location::unknown(),
         );
-        let result = lower_module(&ctx, module_op);
+        let result = lower_module(&ctx, module_op, None);
         assert!(result.is_err());
     }
 
@@ -726,7 +724,7 @@ mod tests {
     #[test]
     fn test_end_to_end_return_42() {
         let (ctx, module_op) = build_return_42_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering failed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering failed");
 
         let tmp_dir = std::env::temp_dir();
         let obj_path = tmp_dir.join("mlif_test_return42.o");
@@ -759,7 +757,7 @@ mod tests {
     #[test]
     fn test_end_to_end_add_call() {
         let (ctx, module_op) = build_add_call_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering failed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering failed");
 
         let tmp_dir = std::env::temp_dir();
         let obj_path = tmp_dir.join("mlif_test_add_call.o");
@@ -791,7 +789,7 @@ mod tests {
     #[test]
     fn test_end_to_end_sub() {
         let (ctx, module_op) = build_sub_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering failed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering failed");
 
         let tmp_dir = std::env::temp_dir();
         let obj_path = tmp_dir.join("mlif_test_sub.o");
@@ -823,7 +821,7 @@ mod tests {
     #[test]
     fn test_end_to_end_mul() {
         let (ctx, module_op) = build_mul_module();
-        let bytes = lower_module(&ctx, module_op).expect("lowering failed");
+        let bytes = lower_module(&ctx, module_op, None).expect("lowering failed");
 
         let tmp_dir = std::env::temp_dir();
         let obj_path = tmp_dir.join("mlif_test_mul.o");

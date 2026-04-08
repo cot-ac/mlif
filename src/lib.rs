@@ -41,3 +41,7 @@ pub use sema::{CIRSema, SemaState, SemaStep, StepPosition};
 
 // Re-export verification.
 pub use verify::verifier::verify;
+
+// Re-export codegen construct lowering infrastructure (behind codegen feature).
+#[cfg(feature = "codegen")]
+pub use codegen::{ConstructLowering, LoweringCtx, LoweringRegistry};
