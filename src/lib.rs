@@ -3,6 +3,7 @@ pub mod diagnostic;
 pub mod entity;
 pub mod ir;
 pub mod pass;
+pub mod sema;
 pub mod transform;
 pub mod verify;
 
@@ -34,6 +35,9 @@ pub use pass::pass::Pass;
 
 // Re-export transform types (implementations are on Context).
 pub use transform::walk::{WalkOrder, WalkResult};
+
+// Re-export sema infrastructure.
+pub use sema::{CIRSema, SemaState, SemaStep, StepPosition};
 
 // Re-export verification.
 pub use verify::verifier::verify;

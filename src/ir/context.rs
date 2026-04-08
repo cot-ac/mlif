@@ -100,6 +100,13 @@ impl Default for Context {
     }
 }
 
+impl Context {
+    /// Check if an operation ID refers to a valid (allocated) operation.
+    pub fn op_exists(&self, op: OpId) -> bool {
+        self.ops.get(op).is_some()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Types — interned, structural equality
 // ---------------------------------------------------------------------------
